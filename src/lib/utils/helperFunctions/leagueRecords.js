@@ -140,10 +140,6 @@ const processRegularSeason = async ({rosters, leagueData, curSeason, week, regul
 		week = leagueData.settings.playoff_week_start - 1;
 	}
 
-	for(const rosterID in rosters) {
-		analyzeRosters({year, roster: rosters[rosterID], regularSeason});
-	}
-
 	// loop through each week of the season
 	const matchupsPromises = [];
 	let startWeek = parseInt(week);
@@ -188,6 +184,18 @@ const processRegularSeason = async ({rosters, leagueData, curSeason, week, regul
 	// add matchupDifferentials to tha all time  records
 	regularSeason.addAllTimeMatchupDifferentials(matchupDifferentials);
 
+	// Build each roster's season totals directly from the weekly matchups we just
+	// fetched, rather than trusting Sleeper's cumulative roster.settings fields
+	// (wins/losses/ties/fpts). Those fields can be wrong if a league carried stats
+	// over between seasons without a proper reset (seen in the wild: a league whose
+	// roster.settings showed 28 games played in a season with only 14 scheduled
+	// weeks). Deriving totals from the actual fetched weeks makes this self-correcting
+	// regardless of what Sleeper's own counters say.
+	const rosterSeasonTotals = buildRosterSeasonTotals({seasonPointsRecord, matchupDifferentials});
+
+	for(const rosterID in rosters) {
+		analyzeRosters({year, roster: rosters[rosterID], rosterSeasonTotals: rosterSeasonTotals[rosterID], regularSeason});
+	}
 
 	if(seasonPointsHighs.length > 0) {
 		regularSeason.addSeasonWeekRecord({
@@ -207,6 +215,60 @@ const processRegularSeason = async ({rosters, leagueData, curSeason, week, regul
 	}
 }
 
+/**
+ * Builds season-long win/loss/tie/points totals for each roster directly from the
+ * weekly matchup data already fetched for this season, instead of relying on
+ * Sleeper's cumulative roster.settings fields.
+ * @param {Object} totals
+ * @param {Object[]} totals.seasonPointsRecord entries of {rosterID, fpts, week, year} for every roster/week fetched this season
+ * @param {Object[]} totals.matchupDifferentials entries of {home: {rosterID, fpts}, away: {rosterID, fpts}, differential} for every matchup fetched this season
+ * @returns {Object} keyed by rosterID: {fptsFor, fptsAgainst, wins, losses, ties, games}
+ */
+const buildRosterSeasonTotals = ({seasonPointsRecord, matchupDifferentials}) => {
+	const totals = {};
+
+	const ensure = (rosterID) => {
+		if(!totals[rosterID]) {
+			totals[rosterID] = {
+				fptsFor: 0,
+				fptsAgainst: 0,
+				wins: 0,
+				losses: 0,
+				ties: 0,
+				games: 0,
+			};
+		}
+		return totals[rosterID];
+	}
+
+	// fptsFor and games played come directly from the weekly scores we fetched
+	for(const entry of seasonPointsRecord) {
+		const t = ensure(entry.rosterID);
+		t.fptsFor += entry.fpts;
+		t.games++;
+	}
+
+	// wins/losses/ties/fptsAgainst come from the head-to-head matchups we fetched
+	for(const matchup of matchupDifferentials) {
+		const home = ensure(matchup.home.rosterID);
+		const away = ensure(matchup.away.rosterID);
+
+		home.fptsAgainst += matchup.away.fpts;
+		away.fptsAgainst += matchup.home.fpts;
+
+		if(matchup.home.fpts === matchup.away.fpts) {
+			home.ties++;
+			away.ties++;
+		} else {
+			// processMatchups always orders "home" as the higher score
+			home.wins++;
+			away.losses++;
+		}
+	}
+
+	return totals;
+}
+
 
 /**
  * Analyzes an individual roster and adds entries for that roster's
@@ -214,28 +276,39 @@ const processRegularSeason = async ({rosters, leagueData, curSeason, week, regul
  * @param {Object} rosterData the roster data to be analyzed
  * @param {int} rosterData.year the year being analyzed
  * @param {Object} rosterData.roster the roster being analyzed
+ * @param {Object} rosterData.rosterSeasonTotals this roster's totals derived from the fetched weekly matchups {fptsFor, fptsAgainst, wins, losses, ties, games}
  * @param {Records} rosterData.regularSeason the global regularSeason object that will be updated and returned
  */
-const analyzeRosters = ({year, roster, regularSeason}) => {
+const analyzeRosters = ({year, roster, rosterSeasonTotals, regularSeason}) => {
     // team name and logo are tied to the ownerID
     const rosterID = roster.roster_id;
 
     const managers = getManagers(roster);
 
-	// season hasn't started, no records to obtain
-	if(roster.settings.wins == 0 && roster.settings.ties == 0 && roster.settings.losses == 0) return;
+	// no games recorded in the weeks we fetched for this roster - nothing to add
+	// (covers both "season hasn't started yet" and "no matchup data available")
+	if(!rosterSeasonTotals || rosterSeasonTotals.games === 0) return;
 
-	// fptsFor and fptsPerGame are used for both rosterRecords and seasonLongPoints
-	const fptsFor = roster.settings.fpts + (roster.settings.fpts_decimal / 100);
-	const fptsPerGame = round(fptsFor / (roster.settings.wins + roster.settings.losses + roster.settings.ties));
+	// fptsFor and fptsPerGame are used for both rosterRecords and seasonLongPoints.
+	// Derived from the actual weekly matchups fetched, not roster.settings, so this
+	// stays correct even if Sleeper's cumulative counters are off for this league.
+	// NOTE: fptsFor and fptsAgainst are kept as raw numbers (not run through round(),
+	// which returns a string) because they get accumulated with += elsewhere - only
+	// fptsPerGame, which is purely for display, gets rounded.
+	const fptsFor = rosterSeasonTotals.fptsFor;
+	const fptsPerGame = round(fptsFor / rosterSeasonTotals.games);
 
 	const rosterRecords = {
-		wins:  roster.settings.wins,
-		losses:  roster.settings.losses,
-		ties:  roster.settings.ties,
+		wins: rosterSeasonTotals.wins,
+		losses: rosterSeasonTotals.losses,
+		ties: rosterSeasonTotals.ties,
 		fptsFor,
-		fptsAgainst:  roster.settings.fpts_against + (roster.settings.fpts_against_decimal / 100),
+		fptsAgainst: rosterSeasonTotals.fptsAgainst,
 		fptsPerGame,
+		// potentialPoints (optimal lineup score) isn't derivable from matchup totals
+		// alone, so this still comes from Sleeper's own field. NOTE: in a league with
+		// the doubled-games issue described above, this figure - and any Lineup IQ %
+		// calculated from it - may still reflect more than one season's worth of data.
 		potentialPoints:  roster.settings.ppts + (roster.settings.ppts_decimal / 100),
 		rosterID,
 		year,
